@@ -33,6 +33,21 @@ function App() {
   const [completedBoxes, setCompletedBoxes] = useState(new Set())
   const [noteMode, setNoteMode] = useState(false)
   const [selectionBox, setSelectionBox] = useState(null) // New: Selection Box Coords
+  
+  // Mode switching: 'test' = LV Cable Test Results, 'termination' = LV Cable Termination Progress
+  const [activeMode, setActiveMode] = useState('test')
+  
+  // Termination tracking state - load from localStorage
+  const [terminationProgress, setTerminationProgress] = useState(() => {
+    try {
+      const saved = localStorage.getItem('terminationProgress')
+      return saved ? JSON.parse(saved) : {}
+    } catch {
+      return {}
+    }
+  })
+  const [selectedInverter, setSelectedInverter] = useState(null) // For editing termination progress
+  const [editingTerminated, setEditingTerminated] = useState('')
   const [notes, setNotes] = useState([])
   const [selectedNote, setSelectedNote] = useState(null)
   const [noteEditor, setNoteEditor] = useState(null)
@@ -59,60 +74,80 @@ function App() {
     return map
   }, [layers])
 
-  // Pre-compute scaled and translated geometries for performance
-  const processedBoxes = useMemo(() => {
-    if (!bounds || !layers['lv-inverter-bx']) return []
+  // Extract inverter IDs and circuit counts from table_id layer using regex
+  const inverterCircuitData = useMemo(() => {
+    const circuitCounts = {} // { inverterId: count }
+    const inverterPositions = {} // { inverterId: { position, text } }
     
-    const layer = layers['lv-inverter-bx']
-    return layer.features.map((feature, index) => {
-      const boxId = feature.properties?.id || index
-      if (!feature._analysis || !feature._analysis.center) {
-        return { boxId, geometry: feature.geometry, center: null }
-      }
-      
-      const center = feature._analysis.center
-      const area = feature._analysis.area
-      
-      // Pre-compute offset
-      const dx = center[0] - bounds.centerLng
-      const dy = center[1] - bounds.centerLat
-      const dist = Math.sqrt(dx * dx + dy * dy) || 1
-      const approxWidth = Math.sqrt(area) || 0
-      const spread = approxWidth * 2.0
-      const offsetLng = (dx / dist) * spread
-      const offsetLat = (dy / dist) * spread
-      
-      // Pre-compute scaled geometry
-      const scaleFactor = 1.75
-      const scaleCoord = (coord) => {
-        const [lng, lat] = coord
-        return [
-          center[0] + (lng - center[0]) * scaleFactor + offsetLng,
-          center[1] + (lat - center[1]) * scaleFactor + offsetLat
-        ]
-      }
-      
-      let scaledCoords
-      if (feature.geometry.type === 'LineString') {
-        scaledCoords = feature.geometry.coordinates.map(scaleCoord)
-      } else if (feature.geometry.type === 'Polygon') {
-        scaledCoords = feature.geometry.coordinates.map(ring => ring.map(scaleCoord))
-      } else {
-        scaledCoords = feature.geometry.coordinates
-      }
-      
-      return {
-        boxId,
-        geometry: { type: feature.geometry.type, coordinates: scaledCoords },
-        center: [center[0] + offsetLng, center[1] + offsetLat],
-        area
-      }
+    // Process table_id to count circuits per inverter
+    if (layers.table_id && layers.table_id.features) {
+      layers.table_id.features.forEach(feature => {
+        const text = feature.properties?.text
+        if (text) {
+          // Extract inverter ID using regex: TX[0-9]+-INV[0-9]+
+          const match = text.match(/^(TX\d+-INV\d+)/i)
+          if (match) {
+            const inverterId = match[1].toUpperCase()
+            circuitCounts[inverterId] = (circuitCounts[inverterId] || 0) + 1
+          }
+        }
+      })
+    }
+    
+    // Get positions from inv_id layer
+    if (layers.inv_id && layers.inv_id.features) {
+      layers.inv_id.features.forEach(feature => {
+        const text = feature.properties?.text
+        if (text && feature.geometry.type === 'Point') {
+          // Normalize the inverter ID
+          const match = text.match(/^(TX\d+-INV\s*\d+)/i)
+          if (match) {
+            const normalizedId = match[1].replace(/\s+/g, '').toUpperCase()
+            inverterPositions[normalizedId] = {
+              position: feature.geometry.coordinates,
+              text: text
+            }
+          }
+        }
+      })
+    }
+    
+    return { circuitCounts, inverterPositions }
+  }, [layers])
+
+  // Calculate termination summary stats
+  const terminationStats = useMemo(() => {
+    const { circuitCounts } = inverterCircuitData
+    const inverterIds = Object.keys(circuitCounts)
+    
+    let totalCircuits = 0
+    let terminated = 0
+    
+    inverterIds.forEach(inverterId => {
+      const total = circuitCounts[inverterId] || 0
+      const done = terminationProgress[inverterId] || 0
+      totalCircuits += total
+      terminated += Math.min(done, total) // Cap at total
     })
-  }, [layers, bounds])
+    
+    const remaining = totalCircuits - terminated
+    const percentage = totalCircuits > 0 ? Math.round((terminated / totalCircuits) * 100) : 0
+    
+    return { totalCircuits, terminated, remaining, percentage, inverterCount: inverterIds.length }
+  }, [inverterCircuitData, terminationProgress])
+
+  // Save termination progress to localStorage
+  useEffect(() => {
+    try {
+      localStorage.setItem('terminationProgress', JSON.stringify(terminationProgress))
+    } catch (e) {
+      console.warn('Failed to save termination progress:', e)
+    }
+  }, [terminationProgress])
 
   // Load GeoJSON data
   useEffect(() => {
-    const files = ['text', 'lv-inverter-bx', 'poly']
+    const files = ['inv_id', 'table_id', 'poly', 'boudnry_line']
     
     Promise.all(
       files.map(name => 
@@ -127,7 +162,6 @@ function App() {
     ).then(results => {
       const layerData = {}
       let allCoords = []
-      let inverterAreas = []
       let tempInverterLabels = []
 
       results.forEach(({ name, data }) => {
@@ -137,44 +171,29 @@ function App() {
           data.features.forEach(f => {
             const coords = extractCoords(f.geometry)
             allCoords = allCoords.concat(coords)
-
-            // Process Inverters for Labels
-            if (name === 'lv-inverter-bx') {
-              const info = getBoundsAndCenter(f.geometry)
-              if (info) {
-                inverterAreas.push(info.area)
-                f._analysis = info
-              }
-            }
           })
         }
       })
 
-      // Determine threshold for Big vs Small inverters
-      if (inverterAreas.length > 0) {
-        const avgArea = inverterAreas.reduce((a, b) => a + b, 0) / inverterAreas.length
-        
-        if (layerData['lv-inverter-bx']) {
-          layerData['lv-inverter-bx'].features.forEach((f, index) => {
-            if (f._analysis) {
-              const isBig = f._analysis.area > avgArea
-              const boxId = f.properties?.id || index
-              tempInverterLabels.push({
-                position: f._analysis.center,
-                area: f._analysis.area,
-                text: isBig ? 'INV' : 'LV',
-                isBig,
-                boxId // Include box ID for completion check
-              })
-            }
-          })
-        }
+      // Process inv_id layer for clickable inverter points
+      if (layerData['inv_id']) {
+        layerData['inv_id'].features.forEach((f, index) => {
+          if (f.geometry.type === 'Point' && f.properties?.text) {
+            const coords = f.geometry.coordinates
+            const boxId = f.properties.text // Use the text property as boxId
+            tempInverterLabels.push({
+              position: [coords[0], coords[1]],
+              text: f.properties.text,
+              boxId
+            })
+          }
+        })
       }
 
       setLayers(layerData)
       setInverterLabels(tempInverterLabels)
-      // Set total box count from actual GeoJSON features
-      setTotalBoxCount(layerData['lv-inverter-bx']?.features?.length || 0)
+      // Set total box count from inv_id features
+      setTotalBoxCount(layerData['inv_id']?.features?.length || 0)
       
       // Calculate bounds
       if (allCoords.length > 0) {
@@ -389,9 +408,8 @@ function App() {
     // Calculate zoom level for text visibility
     const zoomRatio = viewState.scale / viewState.baseScale
     const showDetailedText = zoomRatio > 0.5 // Hide detailed text when zoomed out too much
-    const showInverterLabels = zoomRatio > 0.3
     
-    // Draw Poly Layer (background)
+    // Draw Poly Layer (background - display only)
     if (layers.poly && layers.poly.features) {
       ctx.strokeStyle = '#1a1a1a' // Black stroke
       ctx.lineWidth = 1
@@ -401,21 +419,109 @@ function App() {
         drawGeometry(ctx, feature.geometry, true)
       })
     }
-    
-    // Draw Inverter Boxes - use pre-computed geometries
-    if (processedBoxes.length > 0) {
-      processedBoxes.forEach(({ boxId, geometry }) => {
-        const isCompleted = completedBoxes.has(boxId)
-        
-        // Bright green for completed, orange for pending
-        ctx.strokeStyle = isCompleted ? '#22c55e' : '#e67e22'
-        ctx.lineWidth = isCompleted ? 3 : 2
-        ctx.fillStyle = isCompleted ? 'rgba(34, 197, 94, 0.5)' : 'rgba(230, 126, 34, 0.4)'
-        
-        drawGeometry(ctx, geometry, true)
+
+    // Draw Boundary Line (display only)
+    if (layers.boudnry_line && layers.boudnry_line.features) {
+      ctx.strokeStyle = '#0066cc' // Blue stroke for boundary
+      ctx.lineWidth = 2
+      
+      layers.boudnry_line.features.forEach(feature => {
+        drawGeometry(ctx, feature.geometry, false)
       })
     }
     
+    // Draw Inverter clickable points from inv_id
+    if (inverterLabels.length > 0) {
+      // Font size scales with zoom
+      const baseFontSize = 0.00003 // World units
+      const fontSize = Math.max(8, Math.min(14, baseFontSize * viewState.scale))
+      const pointRadius = Math.max(8, Math.min(16, 10 * zoomRatio))
+      
+      ctx.font = `bold ${fontSize}px Arial`
+      ctx.textAlign = 'center'
+      ctx.textBaseline = 'middle'
+      ctx.lineWidth = 2
+      
+      if (activeMode === 'test') {
+        // Test mode: draw inverter points with completed/not completed status
+        inverterLabels.forEach(label => {
+          const { x, y } = worldToScreen(label.position[0], label.position[1])
+          const isCompleted = completedBoxes.has(label.boxId)
+          
+          // Draw clickable point circle
+          ctx.beginPath()
+          ctx.arc(x, y, pointRadius, 0, 2 * Math.PI)
+          ctx.fillStyle = isCompleted ? 'rgba(34, 197, 94, 0.7)' : 'rgba(230, 126, 34, 0.6)'
+          ctx.strokeStyle = isCompleted ? '#22c55e' : '#e67e22'
+          ctx.lineWidth = isCompleted ? 3 : 2
+          ctx.fill()
+          ctx.stroke()
+          
+          // Draw label text on the point if zoomed in enough
+          if (showDetailedText) {
+            ctx.fillStyle = '#ffffff'
+            ctx.strokeStyle = isCompleted ? '#166534' : '#9a3412'
+            ctx.lineWidth = 2
+            ctx.strokeText(label.text, x, y)
+            ctx.fillText(label.text, x, y)
+          }
+        })
+      } else {
+        // Termination mode: draw inverters with progress (terminated/total)
+        const { circuitCounts, inverterPositions } = inverterCircuitData
+        
+        Object.keys(circuitCounts).forEach(inverterId => {
+          const posData = inverterPositions[inverterId]
+          if (!posData) return
+          
+          const { x, y } = worldToScreen(posData.position[0], posData.position[1])
+          const total = circuitCounts[inverterId]
+          const terminated = terminationProgress[inverterId] || 0
+          const isCompleted = terminated >= total
+          const hasProgress = terminated > 0
+          
+          // Draw larger clickable rectangle for termination mode
+          const boxWidth = Math.max(40, Math.min(80, 50 * zoomRatio))
+          const boxHeight = Math.max(25, Math.min(45, 30 * zoomRatio))
+          
+          ctx.beginPath()
+          ctx.roundRect(x - boxWidth/2, y - boxHeight/2, boxWidth, boxHeight, 6)
+          
+          if (isCompleted) {
+            ctx.fillStyle = 'rgba(34, 197, 94, 0.8)'
+            ctx.strokeStyle = '#22c55e'
+          } else if (hasProgress) {
+            ctx.fillStyle = 'rgba(251, 191, 36, 0.7)'
+            ctx.strokeStyle = '#f59e0b'
+          } else {
+            ctx.fillStyle = 'rgba(239, 68, 68, 0.6)'
+            ctx.strokeStyle = '#ef4444'
+          }
+          ctx.lineWidth = isCompleted ? 3 : 2
+          ctx.fill()
+          ctx.stroke()
+          
+          // Draw progress text
+          if (showDetailedText || zoomRatio > 0.3) {
+            const progressText = `${terminated}/${total}`
+            ctx.fillStyle = '#ffffff'
+            ctx.strokeStyle = isCompleted ? '#166534' : (hasProgress ? '#92400e' : '#991b1b')
+            ctx.lineWidth = 2
+            ctx.strokeText(progressText, x, y)
+            ctx.fillText(progressText, x, y)
+            
+            // Draw inverter label above the box
+            if (showDetailedText) {
+              const labelY = y - boxHeight/2 - 8
+              ctx.font = `bold ${Math.max(6, fontSize - 2)}px Arial`
+              ctx.strokeText(inverterId, x, labelY)
+              ctx.fillText(inverterId, x, labelY)
+            }
+          }
+        })
+      }
+    }
+
     // Draw Notes
     if (notes.length > 0) {
       notes.forEach(note => {
@@ -439,39 +545,7 @@ function App() {
       })
     }
     
-    // Draw Inverter Labels (INV / LV) - scale with zoom, use pre-computed centers
-    if (showInverterLabels && processedBoxes.length > 0) {
-      // Font size scales with zoom
-      const baseFontSize = 0.00003 // World units
-      const fontSize = Math.max(6, Math.min(14, baseFontSize * viewState.scale))
-      
-      ctx.font = `bold ${fontSize}px Arial`
-      ctx.textAlign = 'center'
-      ctx.textBaseline = 'middle'
-      ctx.lineWidth = 2
-      
-      // Create a quick lookup for labels by boxId
-      const labelMap = new Map(inverterLabels.map(l => [l.boxId, l]))
-      
-      processedBoxes.forEach(({ boxId, center }) => {
-        if (!center) return
-        const label = labelMap.get(boxId)
-        if (!label) return
-
-        const { x, y } = worldToScreen(center[0], center[1])
-        const isCompleted = completedBoxes.has(boxId)
-        
-        // Green stroke for completed, orange for pending
-        ctx.strokeStyle = isCompleted ? '#22c55e' : '#e67e22'
-        ctx.fillStyle = '#ffffff'
-        
-        // Draw text with stroke for visibility
-        ctx.strokeText(label.text, x, y)
-        ctx.fillText(label.text, x, y)
-      })
-    }
-    
-    // Draw Text Labels - ONLY ON HOVER
+    // Draw Text Labels - ONLY ON HOVER (from table_id layer)
     if (hoveredText) {
       // Font size scales proportionally with zoom
       const baseFontSize = 0.00004 // World units
@@ -506,7 +580,7 @@ function App() {
       ctx.strokeRect(startX, startY, width, height)
     }
     
-  }, [layers, bounds, viewState, inverterLabels, worldToScreen, hoveredText, completedBoxes, notes, selectionBox, processedBoxes])
+  }, [layers, bounds, viewState, inverterLabels, worldToScreen, hoveredText, completedBoxes, notes, selectionBox, activeMode, inverterCircuitData, terminationProgress])
 
   // Draw geometry helper
   const drawGeometry = useCallback((ctx, geometry, fill = false) => {
@@ -747,27 +821,50 @@ function App() {
       flushSync(() => {
         setNotes(prev => [...prev, newNote])
       })
-    } else {
-      // Check if clicked on a box - use pre-computed centers
-      for (const { boxId, center } of processedBoxes) {
-        if (!center) continue
-        const { x, y } = worldToScreen(center[0], center[1])
+    } else if (activeMode === 'test') {
+      // Test mode: Check if clicked on an inverter point from inv_id layer
+      for (const label of inverterLabels) {
+        const { x, y } = worldToScreen(label.position[0], label.position[1])
         const dist = Math.sqrt(Math.pow(mouseX - x, 2) + Math.pow(mouseY - y, 2))
         if (dist < 30) { // Click radius
           setCompletedBoxes(prev => {
             const newSet = new Set(prev)
-            if (newSet.has(boxId)) {
-              newSet.delete(boxId)
+            if (newSet.has(label.boxId)) {
+              newSet.delete(label.boxId)
             } else {
-              newSet.add(boxId)
+              newSet.add(label.boxId)
             }
             return newSet
           })
           break
         }
       }
+    } else {
+      // Termination mode: Check if clicked on an inverter box
+      const { circuitCounts, inverterPositions } = inverterCircuitData
+      const zoomRatio = viewState.scale / viewState.baseScale
+      const boxWidth = Math.max(40, Math.min(80, 50 * zoomRatio))
+      const boxHeight = Math.max(25, Math.min(45, 30 * zoomRatio))
+      
+      for (const inverterId of Object.keys(circuitCounts)) {
+        const posData = inverterPositions[inverterId]
+        if (!posData) continue
+        
+        const { x, y } = worldToScreen(posData.position[0], posData.position[1])
+        
+        // Check if click is within the box
+        if (mouseX >= x - boxWidth/2 && mouseX <= x + boxWidth/2 &&
+            mouseY >= y - boxHeight/2 && mouseY <= y + boxHeight/2) {
+          // Open editor for this inverter
+          const total = circuitCounts[inverterId]
+          const currentTerminated = terminationProgress[inverterId] || 0
+          setSelectedInverter({ id: inverterId, total, x: mouseX, y: mouseY })
+          setEditingTerminated(String(currentTerminated))
+          break
+        }
+      }
     }
-  }, [noteMode, notes, worldToScreen, screenToWorld, processedBoxes])
+  }, [noteMode, notes, worldToScreen, screenToWorld, inverterLabels, activeMode, inverterCircuitData, viewState, terminationProgress])
 
   const handleMouseMove = useCallback((e) => {
     // Handle Selection (Left Drag) - use ref for smooth updates
@@ -809,8 +906,8 @@ function App() {
       return
     }
 
-    // Handle Hover for Text IDs
-    if (layers.text && layers.text.features && bounds) {
+    // Handle Hover for Table IDs (from table_id layer)
+    if (layers.table_id && layers.table_id.features && bounds) {
       const canvas = canvasRef.current
       if (!canvas) return
       
@@ -822,7 +919,7 @@ function App() {
       let closest = null
       let minDist = 20 // Detection radius in pixels
 
-      for (const feature of layers.text.features) {
+      for (const feature of layers.table_id.features) {
         if (feature.geometry && feature.geometry.type === 'Point') {
           const coords = feature.geometry.coordinates
           const { x, y } = worldToScreen(coords[0], coords[1])
@@ -854,12 +951,11 @@ function App() {
         
         const selectedIds = []
         
-        // Use pre-computed centers for fast selection
-        processedBoxes.forEach(({ boxId, center }) => {
-          if (!center) return
-          const { x, y } = worldToScreen(center[0], center[1])
+        // Use inverter labels for selection (from inv_id layer)
+        inverterLabels.forEach(label => {
+          const { x, y } = worldToScreen(label.position[0], label.position[1])
           if (x >= minX && x <= maxX && y >= minY && y <= maxY) {
-            selectedIds.push(boxId)
+            selectedIds.push(label.boxId)
           }
         })
         
@@ -880,7 +976,7 @@ function App() {
       setSelectionBox(null)
     }
     isPanning.current = false
-  }, [processedBoxes, worldToScreen])
+  }, [inverterLabels, worldToScreen])
 
   // Touch support for mobile
   const lastTouch = useRef({ x: 0, y: 0 })
@@ -939,17 +1035,44 @@ function App() {
   return (
     <div className="map-container" style={{ width: '100%', height: '100vh', overflow: 'hidden', position: 'relative' }}>
       <div className="top-panel">
+        {/* Mode Switch Buttons */}
+        <div className="mode-switcher">
+          <button 
+            className={`mode-btn ${activeMode === 'test' ? 'active' : ''}`}
+            onClick={() => setActiveMode('test')}
+          >
+            🔌 LV Cable Test
+          </button>
+          <button 
+            className={`mode-btn ${activeMode === 'termination' ? 'active' : ''}`}
+            onClick={() => setActiveMode('termination')}
+          >
+            🔗 Cable Termination
+          </button>
+        </div>
+
+        {/* Counters - different for each mode */}
         <div className="counters">
-          <div className="counter-row">
-            <span className="counter-label">LV Box Total: {inverterLabels.filter(l => !l.isBig).length}</span>
-            <span className="counter-item completed">Done <strong>{inverterLabels.filter(l => !l.isBig && completedBoxes.has(l.boxId)).length}</strong></span>
-            <span className="counter-item remaining">Remain <strong>{inverterLabels.filter(l => !l.isBig && !completedBoxes.has(l.boxId)).length}</strong></span>
-          </div>
-          <div className="counter-row">
-            <span className="counter-label">INVERTER Total: {inverterLabels.filter(l => l.isBig).length}</span>
-            <span className="counter-item completed">Done <strong>{inverterLabels.filter(l => l.isBig && completedBoxes.has(l.boxId)).length}</strong></span>
-            <span className="counter-item remaining">Remain <strong>{inverterLabels.filter(l => l.isBig && !completedBoxes.has(l.boxId)).length}</strong></span>
-          </div>
+          {activeMode === 'test' ? (
+            <>
+              <div className="counter-row">
+                <span className="counter-label">Total Inverters: {inverterLabels.length}</span>
+                <span className="counter-item completed">Done <strong>{completedBoxes.size}</strong></span>
+                <span className="counter-item remaining">Remain <strong>{inverterLabels.length - completedBoxes.size}</strong></span>
+              </div>
+            </>
+          ) : (
+            <>
+              <div className="counter-row">
+                <span className="counter-label">Total Circuits: {terminationStats.totalCircuits}</span>
+                <span className="counter-item completed">Terminated <strong>{terminationStats.terminated}</strong></span>
+                <span className="counter-item remaining">Remain <strong>{terminationStats.remaining}</strong></span>
+                <span className="counter-item" style={{ background: 'rgba(59, 130, 246, 0.2)', borderColor: 'rgba(59, 130, 246, 0.4)' }}>
+                  <strong>{terminationStats.percentage}%</strong>
+                </span>
+              </div>
+            </>
+          )}
         </div>
 
         <div className="toolbar">
@@ -1043,7 +1166,7 @@ function App() {
         </div>
       )}
 
-      {/* Legend */}
+      {/* Legend - changes based on active mode */}
       <div style={{
         position: 'absolute',
         top: 80,
@@ -1058,29 +1181,71 @@ function App() {
         color: '#e5e7eb',
         zIndex: 1000
       }}>
-        <div style={{ fontWeight: 700, marginBottom: 10, fontSize: 13, color: '#fff' }}>Legend</div>
-        <div style={{ display: 'flex', alignItems: 'center', marginBottom: 8 }}>
-          <div style={{
-            width: 18,
-            height: 18,
-            borderRadius: 4,
-            background: 'rgba(34, 197, 94, 0.5)',
-            border: '2px solid #22c55e',
-            marginRight: 10
-          }}></div>
-          <span>Installation Done</span>
+        <div style={{ fontWeight: 700, marginBottom: 10, fontSize: 13, color: '#fff' }}>
+          {activeMode === 'test' ? 'Test Results' : 'Termination Progress'}
         </div>
-        <div style={{ display: 'flex', alignItems: 'center' }}>
-          <div style={{
-            width: 18,
-            height: 18,
-            borderRadius: 4,
-            background: 'rgba(230, 126, 34, 0.4)',
-            border: '2px solid #e67e22',
-            marginRight: 10
-          }}></div>
-          <span>Not Installed</span>
-        </div>
+        {activeMode === 'test' ? (
+          <>
+            <div style={{ display: 'flex', alignItems: 'center', marginBottom: 8 }}>
+              <div style={{
+                width: 18,
+                height: 18,
+                borderRadius: 4,
+                background: 'rgba(34, 197, 94, 0.5)',
+                border: '2px solid #22c55e',
+                marginRight: 10
+              }}></div>
+              <span>Test Passed</span>
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center' }}>
+              <div style={{
+                width: 18,
+                height: 18,
+                borderRadius: 4,
+                background: 'rgba(230, 126, 34, 0.4)',
+                border: '2px solid #e67e22',
+                marginRight: 10
+              }}></div>
+              <span>Not Tested</span>
+            </div>
+          </>
+        ) : (
+          <>
+            <div style={{ display: 'flex', alignItems: 'center', marginBottom: 8 }}>
+              <div style={{
+                width: 18,
+                height: 18,
+                borderRadius: 4,
+                background: 'rgba(34, 197, 94, 0.7)',
+                border: '2px solid #22c55e',
+                marginRight: 10
+              }}></div>
+              <span>100% Complete</span>
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', marginBottom: 8 }}>
+              <div style={{
+                width: 18,
+                height: 18,
+                borderRadius: 4,
+                background: 'rgba(251, 191, 36, 0.6)',
+                border: '2px solid #f59e0b',
+                marginRight: 10
+              }}></div>
+              <span>In Progress</span>
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center' }}>
+              <div style={{
+                width: 18,
+                height: 18,
+                borderRadius: 4,
+                background: 'rgba(239, 68, 68, 0.5)',
+                border: '2px solid #ef4444',
+                marginRight: 10
+              }}></div>
+              <span>Not Started</span>
+            </div>
+          </>
+        )}
       </div>
 
       {/* Zoom info overlay */}
@@ -1130,6 +1295,106 @@ function App() {
               setNoteEditor(null)
             }}>Delete</button>
             <button onClick={() => setNoteEditor(null)}>Cancel</button>
+          </div>
+        </div>
+      )}
+
+      {/* Termination Progress Editor Popup */}
+      {selectedInverter && (
+        <div 
+          className="termination-editor"
+          style={{
+            position: 'absolute',
+            left: selectedInverter.x,
+            top: selectedInverter.y - 10,
+            transform: 'translate(-50%, -100%)',
+            background: '#0f172a',
+            border: '1px solid rgba(255,255,255,0.15)',
+            borderRadius: 12,
+            boxShadow: '0 10px 30px rgba(0,0,0,0.4)',
+            padding: '16px',
+            color: '#e5e7eb',
+            minWidth: 220,
+            zIndex: 1100,
+            fontFamily: 'Arial, sans-serif'
+          }}
+        >
+          <div style={{ fontWeight: 700, fontSize: 14, marginBottom: 12, color: '#fff', textAlign: 'center' }}>
+            {selectedInverter.id}
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8, marginBottom: 12 }}>
+            <input
+              type="number"
+              min="0"
+              max={selectedInverter.total}
+              value={editingTerminated}
+              onChange={(e) => setEditingTerminated(e.target.value)}
+              autoFocus
+              style={{
+                width: 60,
+                padding: '8px 12px',
+                borderRadius: 6,
+                border: '1px solid rgba(255,255,255,0.2)',
+                background: 'rgba(255,255,255,0.08)',
+                color: '#fff',
+                fontSize: 16,
+                fontWeight: 700,
+                textAlign: 'center'
+              }}
+            />
+            <span style={{ fontSize: 18, fontWeight: 700, color: '#9ca3af' }}>/</span>
+            <span style={{ fontSize: 18, fontWeight: 700, color: '#fff' }}>{selectedInverter.total}</span>
+          </div>
+          <div style={{ 
+            background: 'rgba(255,255,255,0.1)', 
+            borderRadius: 6, 
+            height: 8, 
+            marginBottom: 12,
+            overflow: 'hidden'
+          }}>
+            <div style={{
+              width: `${Math.min(100, (parseInt(editingTerminated) || 0) / selectedInverter.total * 100)}%`,
+              height: '100%',
+              background: parseInt(editingTerminated) >= selectedInverter.total 
+                ? 'linear-gradient(90deg, #22c55e, #16a34a)'
+                : 'linear-gradient(90deg, #f59e0b, #d97706)',
+              transition: 'width 0.2s'
+            }}></div>
+          </div>
+          <div style={{ display: 'flex', gap: 8 }}>
+            <button 
+              onClick={() => {
+                const value = Math.max(0, Math.min(selectedInverter.total, parseInt(editingTerminated) || 0))
+                setTerminationProgress(prev => ({ ...prev, [selectedInverter.id]: value }))
+                setSelectedInverter(null)
+              }}
+              style={{
+                flex: 1,
+                padding: '8px 16px',
+                border: 'none',
+                borderRadius: 6,
+                background: 'linear-gradient(135deg, #22c55e, #16a34a)',
+                color: '#fff',
+                fontWeight: 600,
+                cursor: 'pointer'
+              }}
+            >
+              Save
+            </button>
+            <button 
+              onClick={() => setSelectedInverter(null)}
+              style={{
+                padding: '8px 16px',
+                border: 'none',
+                borderRadius: 6,
+                background: 'rgba(255,255,255,0.15)',
+                color: '#e5e7eb',
+                fontWeight: 600,
+                cursor: 'pointer'
+              }}
+            >
+              Cancel
+            </button>
           </div>
         </div>
       )}
