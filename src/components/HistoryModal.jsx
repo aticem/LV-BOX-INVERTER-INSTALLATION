@@ -20,7 +20,7 @@ export default function HistoryModal({
     let comparison = 0
     if (sortBy === 'date') {
       comparison = new Date(a.date) - new Date(b.date)
-    } else if (sortBy === 'panels') {
+    } else if (sortBy === 'box installation') {
       comparison = a.installed_panels - b.installed_panels
     } else if (sortBy === 'workers') {
       comparison = a.workers - b.workers
@@ -165,7 +165,7 @@ export default function HistoryModal({
           fontSize: 12
         }}>
           <span style={{ color: '#9ca3af' }}>Sort by:</span>
-          {['date', 'panels', 'workers'].map(field => (
+          {['date', 'box installation', 'workers'].map(field => (
             <button
               key={field}
               onClick={() => {
@@ -221,7 +221,7 @@ export default function HistoryModal({
                   top: 0
                 }}>
                   <th style={{ padding: '10px 12px', textAlign: 'left', color: '#9ca3af', fontWeight: 500 }}>Date</th>
-                  <th style={{ padding: '10px 12px', textAlign: 'center', color: '#9ca3af', fontWeight: 500 }}>Panels</th>
+                  <th style={{ padding: '10px 12px', textAlign: 'center', color: '#9ca3af', fontWeight: 500 }}>Boxes</th>
                   <th style={{ padding: '10px 12px', textAlign: 'center', color: '#9ca3af', fontWeight: 500 }}>Workers</th>
                   <th style={{ padding: '10px 12px', textAlign: 'left', color: '#9ca3af', fontWeight: 500 }}>Subcontractor</th>
                   <th style={{ padding: '10px 12px', textAlign: 'center', color: '#9ca3af', fontWeight: 500 }}></th>

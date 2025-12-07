@@ -28,9 +28,11 @@ function App() {
   })
   const [bounds, setBounds] = useState(null)
   const [inverterLabels, setInverterLabels] = useState([])
+  const [totalBoxCount, setTotalBoxCount] = useState(0) // Actual GeoJSON feature count
   const [hoveredText, setHoveredText] = useState(null)
   const [completedBoxes, setCompletedBoxes] = useState(new Set())
   const [noteMode, setNoteMode] = useState(false)
+  const [selectionBox, setSelectionBox] = useState(null) // New: Selection Box Coords
   const [notes, setNotes] = useState([])
   const [selectedNote, setSelectedNote] = useState(null)
   const [noteEditor, setNoteEditor] = useState(null)
@@ -41,6 +43,19 @@ function App() {
   const isPanning = useRef(false)
   const hasMoved = useRef(false) // Track if actual movement occurred
   const lastMouse = useRef({ x: 0, y: 0 })
+
+  // Quick lookup for box features by id
+  const boxFeatureMap = useMemo(() => {
+    const map = new Map()
+    const layer = layers['lv-inverter-bx']
+    if (layer && layer.features) {
+      layer.features.forEach((feature, index) => {
+        const boxId = feature.properties?.id || index
+        map.set(boxId, feature)
+      })
+    }
+    return map
+  }, [layers])
 
   // Load GeoJSON data
   useEffect(() => {
@@ -93,6 +108,7 @@ function App() {
               const boxId = f.properties?.id || index
               tempInverterLabels.push({
                 position: f._analysis.center,
+                area: f._analysis.area,
                 text: isBig ? 'INV' : 'LV',
                 isBig,
                 boxId // Include box ID for completion check
@@ -104,6 +120,8 @@ function App() {
 
       setLayers(layerData)
       setInverterLabels(tempInverterLabels)
+      // Set total box count from actual GeoJSON features
+      setTotalBoxCount(layerData['lv-inverter-bx']?.features?.length || 0)
       
       // Calculate bounds
       if (allCoords.length > 0) {
@@ -175,6 +193,47 @@ function App() {
     }
   }
 
+  // Scale geometry from center point
+  const scaleGeometryFromCenter = (geometry, center, scaleFactor) => {
+    const scaleCoord = (coord) => {
+      const [lng, lat] = coord
+      const [centerLng, centerLat] = center
+      return [
+        centerLng + (lng - centerLng) * scaleFactor,
+        centerLat + (lat - centerLat) * scaleFactor
+      ]
+    }
+
+    const scaleCoords = (coords) => coords.map(scaleCoord)
+
+    switch (geometry.type) {
+      case 'Polygon':
+        return {
+          ...geometry,
+          coordinates: geometry.coordinates.map(ring => scaleCoords(ring))
+        }
+      case 'MultiPolygon':
+        return {
+          ...geometry,
+          coordinates: geometry.coordinates.map(poly => 
+            poly.map(ring => scaleCoords(ring))
+          )
+        }
+      case 'LineString':
+        return {
+          ...geometry,
+          coordinates: scaleCoords(geometry.coordinates)
+        }
+      case 'MultiLineString':
+        return {
+          ...geometry,
+          coordinates: geometry.coordinates.map(line => scaleCoords(line))
+        }
+      default:
+        return geometry
+    }
+  }
+
   // Transform world coordinates to screen coordinates
   const worldToScreen = useCallback((lng, lat) => {
     if (!bounds) return { x: 0, y: 0 }
@@ -190,6 +249,76 @@ function App() {
     const lat = bounds.centerLat - (screenY - viewState.offsetY) / viewState.scale
     return [lng, lat]
   }, [bounds, viewState])
+
+  // Translate geometry by offsets
+  const translateGeometry = useCallback((geometry, offsetLng, offsetLat) => {
+    const shiftCoord = ([lng, lat]) => [lng + offsetLng, lat + offsetLat]
+
+    const shiftCoords = (coords) => coords.map(shiftCoord)
+
+    switch (geometry.type) {
+      case 'Polygon':
+        return {
+          ...geometry,
+          coordinates: geometry.coordinates.map(ring => shiftCoords(ring))
+        }
+      case 'MultiPolygon':
+        return {
+          ...geometry,
+          coordinates: geometry.coordinates.map(poly =>
+            poly.map(ring => shiftCoords(ring))
+          )
+        }
+      case 'LineString':
+        return { ...geometry, coordinates: shiftCoords(geometry.coordinates) }
+      case 'MultiLineString':
+        return {
+          ...geometry,
+          coordinates: geometry.coordinates.map(line => shiftCoords(line))
+        }
+      default:
+        return geometry
+    }
+  }, [])
+
+  // Compute outward offset to increase spacing between boxes
+  const getBoxOffset = useCallback((center, area) => {
+    if (!bounds || !center || !area) return { dx: 0, dy: 0 }
+    const dx = center[0] - bounds.centerLng
+    const dy = center[1] - bounds.centerLat
+    const dist = Math.sqrt(dx * dx + dy * dy) || 1
+    const approxWidth = Math.sqrt(area) || 0
+    const spread = approxWidth * 2.0 // about two box widths
+    return {
+      dx: (dx / dist) * spread,
+      dy: (dy / dist) * spread
+    }
+  }, [bounds])
+
+  const pointInPolygon = useCallback((point, polygon) => {
+    const [px, py] = point
+    let inside = false
+    for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+      const [xi, yi] = polygon[i]
+      const [xj, yj] = polygon[j]
+      const intersect = ((yi > py) !== (yj > py)) &&
+        (px < ((xj - xi) * (py - yi)) / (yj - yi + 0.0000001) + xi)
+      if (intersect) inside = !inside
+    }
+    return inside
+  }, [])
+
+  const isPointInGeometry = useCallback((geometry, lng, lat) => {
+    if (!geometry) return false
+    const pt = [lng, lat]
+    if (geometry.type === 'Polygon') {
+      return pointInPolygon(pt, geometry.coordinates[0])
+    }
+    if (geometry.type === 'MultiPolygon') {
+      return geometry.coordinates.some(poly => pointInPolygon(pt, poly[0]))
+    }
+    return false
+  }, [pointInPolygon])
 
   // Render everything
   const render = useCallback(() => {
@@ -231,7 +360,16 @@ function App() {
         ctx.lineWidth = isCompleted ? 3 : 2
         ctx.fillStyle = isCompleted ? 'rgba(34, 197, 94, 0.5)' : 'rgba(230, 126, 34, 0.4)'
         
-        drawGeometry(ctx, feature.geometry, true)
+        // Scale box geometry ~3x area and then spread outward to increase gaps
+        if (feature._analysis && feature._analysis.center) {
+          const center = feature._analysis.center
+          const scaledGeometry = scaleGeometryFromCenter(feature.geometry, center, 1.75)
+          const { dx: offsetLng, dy: offsetLat } = getBoxOffset(center, feature._analysis.area)
+          const translated = translateGeometry(scaledGeometry, offsetLng, offsetLat)
+          drawGeometry(ctx, translated, true)
+        } else {
+          drawGeometry(ctx, feature.geometry, true)
+        }
       })
     }
     
@@ -270,7 +408,15 @@ function App() {
       ctx.lineWidth = 2
       
       inverterLabels.forEach(label => {
-        const { x, y } = worldToScreen(label.position[0], label.position[1])
+        const feature = boxFeatureMap.get(label.boxId)
+        if (!feature || !feature._analysis) return
+        
+        // Label position = box center + spacing offset (same as box itself)
+        const offset = getBoxOffset(label.position, label.area)
+        const shiftedLng = label.position[0] + offset.dx
+        const shiftedLat = label.position[1] + offset.dy
+
+        const { x, y } = worldToScreen(shiftedLng, shiftedLat)
         const isCompleted = completedBoxes.has(label.boxId)
         
         // Green stroke for completed, orange for pending
@@ -302,8 +448,23 @@ function App() {
       ctx.strokeText(hoveredText.text, x, y)
       ctx.fillText(hoveredText.text, x, y)
     }
+
+    // Draw Selection Box
+    if (selectionBox) {
+      const { startX, startY, endX, endY, action } = selectionBox
+      const width = endX - startX
+      const height = endY - startY
+      const isRemove = action === 'remove'
+      
+      ctx.strokeStyle = isRemove ? '#ef4444' : '#3b82f6'
+      ctx.lineWidth = 1
+      ctx.fillStyle = isRemove ? 'rgba(239, 68, 68, 0.18)' : 'rgba(59, 130, 246, 0.2)'
+      
+      ctx.fillRect(startX, startY, width, height)
+      ctx.strokeRect(startX, startY, width, height)
+    }
     
-  }, [layers, bounds, viewState, inverterLabels, worldToScreen, hoveredText, completedBoxes, notes])
+  }, [layers, bounds, viewState, inverterLabels, worldToScreen, hoveredText, completedBoxes, notes, selectionBox, translateGeometry, getBoxOffset, boxFeatureMap, isPointInGeometry])
 
   // Draw geometry helper
   const drawGeometry = useCallback((ctx, geometry, fill = false) => {
@@ -421,12 +582,42 @@ function App() {
     }))
   }, [viewState])
 
-  // Pan handlers
+  // Pan/Select handlers
   const handleMouseDown = useCallback((e) => {
-    isPanning.current = true
     hasMoved.current = false // Reset movement tracker
-    lastMouse.current = { x: e.clientX, y: e.clientY }
-  }, [])
+
+    // Middle Mouse Button (1) -> Pan
+    if (e.button === 1) {
+      e.preventDefault()
+      isPanning.current = true
+      lastMouse.current = { x: e.clientX, y: e.clientY }
+      return
+    }
+
+    // Right Mouse Button (2) -> Selection Box for Unselect (if not in note mode)
+    if (e.button === 2 && !noteMode) {
+      e.preventDefault()
+      const canvas = canvasRef.current
+      if (!canvas) return
+      const rect = canvas.getBoundingClientRect()
+      const x = e.clientX - rect.left
+      const y = e.clientY - rect.top
+      
+      setSelectionBox({ startX: x, startY: y, endX: x, endY: y, action: 'remove' })
+      return
+    }
+
+    // Left Mouse Button (0) -> Selection Box for Select (if not in note mode)
+    if (e.button === 0 && !noteMode) {
+      const canvas = canvasRef.current
+      if (!canvas) return
+      const rect = canvas.getBoundingClientRect()
+      const x = e.clientX - rect.left
+      const y = e.clientY - rect.top
+      
+      setSelectionBox({ startX: x, startY: y, endX: x, endY: y, action: 'add' })
+    }
+  }, [noteMode])
 
   const handleCanvasClick = useCallback((e) => {
     // Skip if actual panning occurred
@@ -484,7 +675,11 @@ function App() {
         for (let i = 0; i < layers['lv-inverter-bx'].features.length; i++) {
           const feature = layers['lv-inverter-bx'].features[i]
           if (feature._analysis) {
-            const { x, y } = worldToScreen(feature._analysis.center[0], feature._analysis.center[1])
+            const offset = getBoxOffset(feature._analysis.center, feature._analysis.area)
+            const { x, y } = worldToScreen(
+              feature._analysis.center[0] + offset.dx,
+              feature._analysis.center[1] + offset.dy
+            )
             const dist = Math.sqrt(Math.pow(mouseX - x, 2) + Math.pow(mouseY - y, 2))
             if (dist < 30) { // Click radius
               const boxId = feature.properties?.id || i
@@ -503,10 +698,27 @@ function App() {
         }
       }
     }
-  }, [noteMode, layers, notes, worldToScreen, screenToWorld])
+  }, [noteMode, layers, notes, worldToScreen, screenToWorld, getBoxOffset, boxFeatureMap, isPointInGeometry, translateGeometry])
 
   const handleMouseMove = useCallback((e) => {
-    // Handle Pan
+    // Handle Selection (Left Drag)
+    if (selectionBox) {
+      const canvas = canvasRef.current
+      if (!canvas) return
+      const rect = canvas.getBoundingClientRect()
+      const x = e.clientX - rect.left
+      const y = e.clientY - rect.top
+      
+      setSelectionBox(prev => ({ ...prev, endX: x, endY: y }))
+      
+      // Mark as moved if box has size
+      if (Math.abs(x - selectionBox.startX) > 5 || Math.abs(y - selectionBox.startY) > 5) {
+        hasMoved.current = true
+      }
+      return
+    }
+
+    // Handle Pan (Middle Drag)
     if (isPanning.current) {
       const dx = e.clientX - lastMouse.current.x
       const dy = e.clientY - lastMouse.current.y
@@ -557,11 +769,51 @@ function App() {
       
       setHoveredText(closest)
     }
-  }, [layers, bounds, viewState, worldToScreen])
+  }, [layers, bounds, viewState, worldToScreen, selectionBox])
 
   const handleMouseUp = useCallback(() => {
+    if (selectionBox) {
+      // Finalize selection only if we actually dragged (hasMoved is true)
+      if (hasMoved.current) {
+        const { startX, startY, endX, endY, action } = selectionBox
+        const minX = Math.min(startX, endX)
+        const maxX = Math.max(startX, endX)
+        const minY = Math.min(startY, endY)
+        const maxY = Math.max(startY, endY)
+        
+        const selectedIds = []
+        
+        inverterLabels.forEach(label => {
+          const feature = boxFeatureMap.get(label.boxId)
+          if (!feature || !feature._analysis) return
+          
+          const offset = getBoxOffset(label.position, label.area)
+          const shiftedLng = label.position[0] + offset.dx
+          const shiftedLat = label.position[1] + offset.dy
+
+          const { x, y } = worldToScreen(shiftedLng, shiftedLat)
+          if (x >= minX && x <= maxX && y >= minY && y <= maxY) {
+            selectedIds.push(label.boxId)
+          }
+        })
+        
+        if (selectedIds.length > 0) {
+          setCompletedBoxes(prev => {
+            const newSet = new Set(prev)
+            if (action === 'remove') {
+              selectedIds.forEach(id => newSet.delete(id))
+            } else {
+              selectedIds.forEach(id => newSet.add(id))
+            }
+            return newSet
+          })
+        }
+      }
+      
+      setSelectionBox(null)
+    }
     isPanning.current = false
-  }, [])
+  }, [selectionBox, inverterLabels, worldToScreen])
 
   // Touch support for mobile
   const lastTouch = useRef({ x: 0, y: 0 })
@@ -623,41 +875,13 @@ function App() {
         <div className="counters">
           <div className="counter-row">
             <span className="counter-label">LV Box Total: {inverterLabels.filter(l => !l.isBig).length}</span>
-            <span className="counter-item completed">Done <strong>{Array.from(completedBoxes).filter(id => {
-              const feature = layers['lv-inverter-bx']?.features?.[id]
-              const avgArea = inverterLabels.length > 0 ? inverterLabels.reduce((sum, l, i) => {
-                const f = layers['lv-inverter-bx']?.features?.[i]
-                return sum + (f?._analysis?.area || 0)
-              }, 0) / inverterLabels.length : 0
-              return feature?._analysis && feature._analysis.area <= avgArea
-            }).length}</strong></span>
-            <span className="counter-item remaining">Remain <strong>{inverterLabels.filter(l => !l.isBig).length - Array.from(completedBoxes).filter(id => {
-              const feature = layers['lv-inverter-bx']?.features?.[id]
-              const avgArea = inverterLabels.length > 0 ? inverterLabels.reduce((sum, l, i) => {
-                const f = layers['lv-inverter-bx']?.features?.[i]
-                return sum + (f?._analysis?.area || 0)
-              }, 0) / inverterLabels.length : 0
-              return feature?._analysis && feature._analysis.area <= avgArea
-            }).length}</strong></span>
+            <span className="counter-item completed">Done <strong>{inverterLabels.filter(l => !l.isBig && completedBoxes.has(l.boxId)).length}</strong></span>
+            <span className="counter-item remaining">Remain <strong>{inverterLabels.filter(l => !l.isBig && !completedBoxes.has(l.boxId)).length}</strong></span>
           </div>
           <div className="counter-row">
             <span className="counter-label">INVERTER Total: {inverterLabels.filter(l => l.isBig).length}</span>
-            <span className="counter-item completed">Done <strong>{Array.from(completedBoxes).filter(id => {
-              const feature = layers['lv-inverter-bx']?.features?.[id]
-              const avgArea = inverterLabels.length > 0 ? inverterLabels.reduce((sum, l, i) => {
-                const f = layers['lv-inverter-bx']?.features?.[i]
-                return sum + (f?._analysis?.area || 0)
-              }, 0) / inverterLabels.length : 0
-              return feature?._analysis && feature._analysis.area > avgArea
-            }).length}</strong></span>
-            <span className="counter-item remaining">Remain <strong>{inverterLabels.filter(l => l.isBig).length - Array.from(completedBoxes).filter(id => {
-              const feature = layers['lv-inverter-bx']?.features?.[id]
-              const avgArea = inverterLabels.length > 0 ? inverterLabels.reduce((sum, l, i) => {
-                const f = layers['lv-inverter-bx']?.features?.[i]
-                return sum + (f?._analysis?.area || 0)
-              }, 0) / inverterLabels.length : 0
-              return feature?._analysis && feature._analysis.area > avgArea
-            }).length}</strong></span>
+            <span className="counter-item completed">Done <strong>{inverterLabels.filter(l => l.isBig && completedBoxes.has(l.boxId)).length}</strong></span>
+            <span className="counter-item remaining">Remain <strong>{inverterLabels.filter(l => l.isBig && !completedBoxes.has(l.boxId)).length}</strong></span>
           </div>
         </div>
 
@@ -716,7 +940,7 @@ function App() {
         ref={canvasRef}
         style={{ 
           display: 'block',
-          cursor: isPanning.current ? 'grabbing' : (noteMode ? 'crosshair' : 'grab')
+          cursor: isPanning.current ? 'grabbing' : (noteMode ? 'crosshair' : 'default')
         }}
         onWheel={handleWheel}
         onMouseDown={handleMouseDown}
@@ -724,6 +948,7 @@ function App() {
         onMouseUp={handleMouseUp}
         onMouseLeave={handleMouseUp}
         onClick={handleCanvasClick}
+        onContextMenu={(e) => e.preventDefault()}
         onTouchStart={handleTouchStart}
         onTouchMove={handleTouchMove}
         onTouchEnd={() => { lastPinchDist.current = 0 }}
@@ -807,7 +1032,7 @@ function App() {
       }}>
         <div>Zoom: {(viewState.scale / viewState.baseScale * 100).toFixed(0)}%</div>
         <div style={{ marginTop: 5, color: '#9ca3af', fontSize: 10 }}>
-          Scroll: Zoom | Drag: Pan
+          Scroll: Zoom | Middle Drag: Pan | Left Drag: Select | Right Drag: Unselect
         </div>
       </div>
 

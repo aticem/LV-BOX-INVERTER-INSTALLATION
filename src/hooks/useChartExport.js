@@ -37,7 +37,7 @@ export default function useChartExport() {
     // Header styling
     dataSheet.columns = [
       { header: 'Date', key: 'date', width: 15 },
-      { header: 'Installed Panels', key: 'installed_panels', width: 18 },
+      { header: 'Installed Boxes', key: 'installed_panels', width: 18 },
       { header: 'Workers', key: 'workers', width: 12 },
       { header: 'Subcontractor', key: 'subcontractor', width: 20 },
       { header: 'Cumulative', key: 'cumulative', width: 15 }
@@ -177,7 +177,11 @@ async function createChartPng(data) {
   const labels = data.map(d => formatDate(d.date))
   const panelData = data.map(d => d.installed_panels)
   const workerData = data.map(d => d.workers)
-  const subData = data.map(d => d.subcontractor ? d.subcontractor.slice(0, 3).toUpperCase() : '')
+  const subData = data.map(d => {
+    const sub = d.subcontractor || ''
+    const firstTwo = sub.slice(0, 2).toUpperCase()
+    return firstTwo
+  })
 
   // Create chart
   const chart = new Chart(ctx, {
@@ -186,18 +190,10 @@ async function createChartPng(data) {
       labels,
       datasets: [
         {
-          label: 'Installed Panels',
+          label: 'Installed Boxes',
           data: panelData,
           backgroundColor: 'rgba(34, 197, 94, 0.8)',
           borderColor: 'rgb(22, 163, 74)',
-          borderWidth: 1,
-          borderRadius: 4
-        },
-        {
-          label: 'Workers',
-          data: workerData,
-          backgroundColor: 'rgba(59, 130, 246, 0.8)',
-          borderColor: 'rgb(37, 99, 235)',
           borderWidth: 1,
           borderRadius: 4
         }
@@ -221,14 +217,13 @@ async function createChartPng(data) {
           align: 'top',
           formatter: (value, context) => {
             const idx = context.dataIndex
-            if (context.datasetIndex === 0) {
-              // Show workers count and subcontractor abbreviation on panel bars
-              return `${workerData[idx]}\n${subData[idx]}`
-            }
-            return ''
+            const sub = subData[idx]
+            const workers = workerData[idx]
+            // Show format: AB-12 (subcontractor 2 letters + worker count)
+            return sub ? `${sub}-${workers}` : workers
           },
           font: {
-            size: 10,
+            size: 11,
             weight: 'bold'
           },
           color: '#374151'
