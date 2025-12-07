@@ -43,6 +43,8 @@ function App() {
   const isPanning = useRef(false)
   const hasMoved = useRef(false) // Track if actual movement occurred
   const lastMouse = useRef({ x: 0, y: 0 })
+  const selectionBoxRef = useRef(null) // Use ref for selection box during drag
+  const rafId = useRef(null) // For requestAnimationFrame
 
   // Quick lookup for box features by id
   const boxFeatureMap = useMemo(() => {
@@ -56,6 +58,57 @@ function App() {
     }
     return map
   }, [layers])
+
+  // Pre-compute scaled and translated geometries for performance
+  const processedBoxes = useMemo(() => {
+    if (!bounds || !layers['lv-inverter-bx']) return []
+    
+    const layer = layers['lv-inverter-bx']
+    return layer.features.map((feature, index) => {
+      const boxId = feature.properties?.id || index
+      if (!feature._analysis || !feature._analysis.center) {
+        return { boxId, geometry: feature.geometry, center: null }
+      }
+      
+      const center = feature._analysis.center
+      const area = feature._analysis.area
+      
+      // Pre-compute offset
+      const dx = center[0] - bounds.centerLng
+      const dy = center[1] - bounds.centerLat
+      const dist = Math.sqrt(dx * dx + dy * dy) || 1
+      const approxWidth = Math.sqrt(area) || 0
+      const spread = approxWidth * 2.0
+      const offsetLng = (dx / dist) * spread
+      const offsetLat = (dy / dist) * spread
+      
+      // Pre-compute scaled geometry
+      const scaleFactor = 1.75
+      const scaleCoord = (coord) => {
+        const [lng, lat] = coord
+        return [
+          center[0] + (lng - center[0]) * scaleFactor + offsetLng,
+          center[1] + (lat - center[1]) * scaleFactor + offsetLat
+        ]
+      }
+      
+      let scaledCoords
+      if (feature.geometry.type === 'LineString') {
+        scaledCoords = feature.geometry.coordinates.map(scaleCoord)
+      } else if (feature.geometry.type === 'Polygon') {
+        scaledCoords = feature.geometry.coordinates.map(ring => ring.map(scaleCoord))
+      } else {
+        scaledCoords = feature.geometry.coordinates
+      }
+      
+      return {
+        boxId,
+        geometry: { type: feature.geometry.type, coordinates: scaledCoords },
+        center: [center[0] + offsetLng, center[1] + offsetLat],
+        area
+      }
+    })
+  }, [layers, bounds])
 
   // Load GeoJSON data
   useEffect(() => {
@@ -349,10 +402,9 @@ function App() {
       })
     }
     
-    // Draw Inverter Boxes
-    if (layers['lv-inverter-bx'] && layers['lv-inverter-bx'].features) {
-      layers['lv-inverter-bx'].features.forEach((feature, index) => {
-        const boxId = feature.properties?.id || index
+    // Draw Inverter Boxes - use pre-computed geometries
+    if (processedBoxes.length > 0) {
+      processedBoxes.forEach(({ boxId, geometry }) => {
         const isCompleted = completedBoxes.has(boxId)
         
         // Bright green for completed, orange for pending
@@ -360,16 +412,7 @@ function App() {
         ctx.lineWidth = isCompleted ? 3 : 2
         ctx.fillStyle = isCompleted ? 'rgba(34, 197, 94, 0.5)' : 'rgba(230, 126, 34, 0.4)'
         
-        // Scale box geometry ~3x area and then spread outward to increase gaps
-        if (feature._analysis && feature._analysis.center) {
-          const center = feature._analysis.center
-          const scaledGeometry = scaleGeometryFromCenter(feature.geometry, center, 1.75)
-          const { dx: offsetLng, dy: offsetLat } = getBoxOffset(center, feature._analysis.area)
-          const translated = translateGeometry(scaledGeometry, offsetLng, offsetLat)
-          drawGeometry(ctx, translated, true)
-        } else {
-          drawGeometry(ctx, feature.geometry, true)
-        }
+        drawGeometry(ctx, geometry, true)
       })
     }
     
@@ -396,8 +439,8 @@ function App() {
       })
     }
     
-    // Draw Inverter Labels (INV / LV) - scale with zoom
-    if (showInverterLabels && inverterLabels.length > 0) {
+    // Draw Inverter Labels (INV / LV) - scale with zoom, use pre-computed centers
+    if (showInverterLabels && processedBoxes.length > 0) {
       // Font size scales with zoom
       const baseFontSize = 0.00003 // World units
       const fontSize = Math.max(6, Math.min(14, baseFontSize * viewState.scale))
@@ -407,17 +450,16 @@ function App() {
       ctx.textBaseline = 'middle'
       ctx.lineWidth = 2
       
-      inverterLabels.forEach(label => {
-        const feature = boxFeatureMap.get(label.boxId)
-        if (!feature || !feature._analysis) return
-        
-        // Label position = box center + spacing offset (same as box itself)
-        const offset = getBoxOffset(label.position, label.area)
-        const shiftedLng = label.position[0] + offset.dx
-        const shiftedLat = label.position[1] + offset.dy
+      // Create a quick lookup for labels by boxId
+      const labelMap = new Map(inverterLabels.map(l => [l.boxId, l]))
+      
+      processedBoxes.forEach(({ boxId, center }) => {
+        if (!center) return
+        const label = labelMap.get(boxId)
+        if (!label) return
 
-        const { x, y } = worldToScreen(shiftedLng, shiftedLat)
-        const isCompleted = completedBoxes.has(label.boxId)
+        const { x, y } = worldToScreen(center[0], center[1])
+        const isCompleted = completedBoxes.has(boxId)
         
         // Green stroke for completed, orange for pending
         ctx.strokeStyle = isCompleted ? '#22c55e' : '#e67e22'
@@ -464,7 +506,7 @@ function App() {
       ctx.strokeRect(startX, startY, width, height)
     }
     
-  }, [layers, bounds, viewState, inverterLabels, worldToScreen, hoveredText, completedBoxes, notes, selectionBox, translateGeometry, getBoxOffset, boxFeatureMap, isPointInGeometry])
+  }, [layers, bounds, viewState, inverterLabels, worldToScreen, hoveredText, completedBoxes, notes, selectionBox, processedBoxes])
 
   // Draw geometry helper
   const drawGeometry = useCallback((ctx, geometry, fill = false) => {
@@ -502,22 +544,7 @@ function App() {
     }
   }, [worldToScreen])
 
-  // Keyboard shortcuts
-  useEffect(() => {
-    const handleKeyDown = (e) => {
-      if (e.ctrlKey && e.key === 'z' && !e.shiftKey) {
-        e.preventDefault()
-        undo()
-      } else if (e.ctrlKey && (e.key === 'y' || (e.key === 'z' && e.shiftKey))) {
-        e.preventDefault()
-        redo()
-      }
-    }
-    
-    window.addEventListener('keydown', handleKeyDown)
-    return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [])
-  
+  // Undo/Redo functions
   const undo = useCallback(() => {
     if (historyIndex > 0) {
       setHistoryIndex(historyIndex - 1)
@@ -536,6 +563,22 @@ function App() {
     }
   }, [history, historyIndex])
 
+  // Keyboard shortcuts
+  useEffect(() => {
+    const handleKeyDown = (e) => {
+      if (e.ctrlKey && e.key === 'z' && !e.shiftKey) {
+        e.preventDefault()
+        undo()
+      } else if (e.ctrlKey && (e.key === 'y' || (e.key === 'z' && e.shiftKey))) {
+        e.preventDefault()
+        redo()
+      }
+    }
+    
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [undo, redo])
+
   // Handle resize
   useEffect(() => {
     const handleResize = () => {
@@ -552,10 +595,41 @@ function App() {
     return () => window.removeEventListener('resize', handleResize)
   }, [render])
 
-  // Re-render when state changes
+  // Save state changes to history for undo/redo
   useEffect(() => {
-    render()
-  }, [render, notes, completedBoxes, viewState, hoveredText])
+    const newState = {
+      completedBoxes: Array.from(completedBoxes),
+      notes: notes.map(n => ({ ...n }))
+    }
+    
+    // Don't save if it's the same as current history state
+    if (historyIndex >= 0 && history[historyIndex]) {
+      const current = history[historyIndex]
+      const sameBoxes = newState.completedBoxes.length === current.completedBoxes.length &&
+        newState.completedBoxes.every(id => current.completedBoxes.includes(id))
+      const sameNotes = newState.notes.length === current.notes.length
+      if (sameBoxes && sameNotes) return
+    }
+    
+    // Remove any future history if we're in the middle
+    const newHistory = history.slice(0, historyIndex + 1)
+    newHistory.push(newState)
+    
+    // Keep only last 50 states
+    if (newHistory.length > 50) newHistory.shift()
+    
+    setHistory(newHistory)
+    setHistoryIndex(newHistory.length - 1)
+  }, [completedBoxes, notes])
+
+  // Re-render when state changes - use RAF for smooth animation
+  useEffect(() => {
+    if (rafId.current) cancelAnimationFrame(rafId.current)
+    rafId.current = requestAnimationFrame(render)
+    return () => {
+      if (rafId.current) cancelAnimationFrame(rafId.current)
+    }
+  }, [render, notes, completedBoxes, viewState])
 
   // Mouse wheel zoom
   const handleWheel = useCallback((e) => {
@@ -603,7 +677,9 @@ function App() {
       const x = e.clientX - rect.left
       const y = e.clientY - rect.top
       
-      setSelectionBox({ startX: x, startY: y, endX: x, endY: y, action: 'remove' })
+      const box = { startX: x, startY: y, endX: x, endY: y, action: 'remove' }
+      selectionBoxRef.current = box
+      setSelectionBox(box)
       return
     }
 
@@ -615,7 +691,9 @@ function App() {
       const x = e.clientX - rect.left
       const y = e.clientY - rect.top
       
-      setSelectionBox({ startX: x, startY: y, endX: x, endY: y, action: 'add' })
+      const box = { startX: x, startY: y, endX: x, endY: y, action: 'add' }
+      selectionBoxRef.current = box
+      setSelectionBox(box)
     }
   }, [noteMode])
 
@@ -670,49 +748,42 @@ function App() {
         setNotes(prev => [...prev, newNote])
       })
     } else {
-      // Check if clicked on a box
-      if (layers['lv-inverter-bx'] && layers['lv-inverter-bx'].features) {
-        for (let i = 0; i < layers['lv-inverter-bx'].features.length; i++) {
-          const feature = layers['lv-inverter-bx'].features[i]
-          if (feature._analysis) {
-            const offset = getBoxOffset(feature._analysis.center, feature._analysis.area)
-            const { x, y } = worldToScreen(
-              feature._analysis.center[0] + offset.dx,
-              feature._analysis.center[1] + offset.dy
-            )
-            const dist = Math.sqrt(Math.pow(mouseX - x, 2) + Math.pow(mouseY - y, 2))
-            if (dist < 30) { // Click radius
-              const boxId = feature.properties?.id || i
-              setCompletedBoxes(prev => {
-                const newSet = new Set(prev)
-                if (newSet.has(boxId)) {
-                  newSet.delete(boxId)
-                } else {
-                  newSet.add(boxId)
-                }
-                return newSet
-              })
-              break
+      // Check if clicked on a box - use pre-computed centers
+      for (const { boxId, center } of processedBoxes) {
+        if (!center) continue
+        const { x, y } = worldToScreen(center[0], center[1])
+        const dist = Math.sqrt(Math.pow(mouseX - x, 2) + Math.pow(mouseY - y, 2))
+        if (dist < 30) { // Click radius
+          setCompletedBoxes(prev => {
+            const newSet = new Set(prev)
+            if (newSet.has(boxId)) {
+              newSet.delete(boxId)
+            } else {
+              newSet.add(boxId)
             }
-          }
+            return newSet
+          })
+          break
         }
       }
     }
-  }, [noteMode, layers, notes, worldToScreen, screenToWorld, getBoxOffset, boxFeatureMap, isPointInGeometry, translateGeometry])
+  }, [noteMode, notes, worldToScreen, screenToWorld, processedBoxes])
 
   const handleMouseMove = useCallback((e) => {
-    // Handle Selection (Left Drag)
-    if (selectionBox) {
+    // Handle Selection (Left Drag) - use ref for smooth updates
+    if (selectionBoxRef.current) {
       const canvas = canvasRef.current
       if (!canvas) return
       const rect = canvas.getBoundingClientRect()
       const x = e.clientX - rect.left
       const y = e.clientY - rect.top
       
-      setSelectionBox(prev => ({ ...prev, endX: x, endY: y }))
+      selectionBoxRef.current.endX = x
+      selectionBoxRef.current.endY = y
+      setSelectionBox({ ...selectionBoxRef.current })
       
       // Mark as moved if box has size
-      if (Math.abs(x - selectionBox.startX) > 5 || Math.abs(y - selectionBox.startY) > 5) {
+      if (Math.abs(x - selectionBoxRef.current.startX) > 5 || Math.abs(y - selectionBoxRef.current.startY) > 5) {
         hasMoved.current = true
       }
       return
@@ -772,10 +843,10 @@ function App() {
   }, [layers, bounds, viewState, worldToScreen, selectionBox])
 
   const handleMouseUp = useCallback(() => {
-    if (selectionBox) {
+    if (selectionBoxRef.current) {
       // Finalize selection only if we actually dragged (hasMoved is true)
       if (hasMoved.current) {
-        const { startX, startY, endX, endY, action } = selectionBox
+        const { startX, startY, endX, endY, action } = selectionBoxRef.current
         const minX = Math.min(startX, endX)
         const maxX = Math.max(startX, endX)
         const minY = Math.min(startY, endY)
@@ -783,17 +854,12 @@ function App() {
         
         const selectedIds = []
         
-        inverterLabels.forEach(label => {
-          const feature = boxFeatureMap.get(label.boxId)
-          if (!feature || !feature._analysis) return
-          
-          const offset = getBoxOffset(label.position, label.area)
-          const shiftedLng = label.position[0] + offset.dx
-          const shiftedLat = label.position[1] + offset.dy
-
-          const { x, y } = worldToScreen(shiftedLng, shiftedLat)
+        // Use pre-computed centers for fast selection
+        processedBoxes.forEach(({ boxId, center }) => {
+          if (!center) return
+          const { x, y } = worldToScreen(center[0], center[1])
           if (x >= minX && x <= maxX && y >= minY && y <= maxY) {
-            selectedIds.push(label.boxId)
+            selectedIds.push(boxId)
           }
         })
         
@@ -810,10 +876,11 @@ function App() {
         }
       }
       
+      selectionBoxRef.current = null
       setSelectionBox(null)
     }
     isPanning.current = false
-  }, [selectionBox, inverterLabels, worldToScreen])
+  }, [processedBoxes, worldToScreen])
 
   // Touch support for mobile
   const lastTouch = useRef({ x: 0, y: 0 })
